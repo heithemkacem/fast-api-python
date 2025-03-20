@@ -3,40 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
 import asyncio
+from typing import Dict, List, Optional, Any
 import os
-import re  # Fix: Import regex for JSON extraction
 from pydantic import EmailStr, Extra
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
-from typing import Dict, List, Optional, Any
-import requests
+
 # Load environment variables
 load_dotenv()
-api_key = os.environ["AZURE_OPENAI_API_KEY"]
-endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
-deployment_name = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"]
-api_version = os.environ["AZURE_OPENAI_API_VERSION"]
-
-headers = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {api_key}"
-}
-
-data = {
-    "messages": [{"role": "system", "content": "Test message"}],
-    "temperature": 0.2
-}
-
-url = f"{endpoint}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
-
-try:
-    response = requests.post(url, headers=headers, json=data)
-    print("Azure Response:", response.json())
-except requests.exceptions.RequestException as e:
-    print("Request failed:", str(e))
-
-
 
 app = FastAPI()
 
@@ -55,21 +30,13 @@ def load_rules():
         return json.load(file)
 
 RULES = load_rules()
-print("API Key:", os.environ.get("AZURE_OPENAI_API_KEY"))
-print("API Version:", os.environ.get("AZURE_OPENAI_API_VERSION"))
-print("Endpoint:", os.environ.get("AZURE_OPENAI_ENDPOINT"))
-print("Chat Deployment Name:", os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"))
 
 # Azure OpenAI Model Configuration
 llm = AzureChatOpenAI(
-    openai_api_key=os.environ["AZURE_OPENAI_API_KEY"],  # REQUIRED!
     openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],  # REQUIRED!
     azure_deployment=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
-    temperature=0.2
+    temperature=0.2,
 )
-
-
 
 # Models
 class KYCData(BaseModel):
@@ -81,9 +48,9 @@ class KYCData(BaseModel):
     phone_number: Optional[str] = None
     address: Optional[str] = None
     transaction_history: Optional[List[Dict[str, Any]]] = None
-
+    
     class Config:
-        extra = Extra.allow  # Allow extra fields in the JSON
+        extra = Extra.allow  # Allow extra fields in the JSONs
 
 class RiskAssessment(BaseModel):
     risk_score: float
@@ -104,26 +71,18 @@ class KYCResponse(BaseModel):
     risk: Dict[str, Any]
     fraud: Dict[str, Any]
     compliance: Dict[str, Any]
-
 async def call_azure_openai(prompt: str):
-    """Send a prompt to the Azure OpenAI model and extract JSON response."""
     response = llm.invoke(prompt)
-    raw_content = response.content
-    print("Raw Azure OpenAI Response:", raw_content)  # Debugging print
 
-    # Extract JSON from the response text
-    match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+    # Extract JSON from the response text using regex
+    match = re.search(r"\{.*\}", response.content, re.DOTALL)
     if match:
         try:
-            parsed_response = json.loads(match.group(0))
-            print("Parsed JSON Response:", parsed_response)  # Debugging print
-            return parsed_response
+            return json.loads(match.group(0))
         except json.JSONDecodeError:
-            print("JSON Parsing Error")  # Debugging print
-            return {"error": "Invalid JSON extracted", "raw_response": raw_content}
-
-    print("No JSON found in response")  # Debugging print
-    return {"error": "No JSON found", "raw_response": raw_content}
+            return {"error": "Invalid JSON extracted", "raw_response": response.content}
+    
+    return {"error": "No JSON found", "raw_response": response.content}
 
 async def check_risk(kyc_json: dict):
     prompt_template = PromptTemplate(
@@ -133,21 +92,22 @@ async def check_risk(kyc_json: dict):
             "{kyc_data}\n\n"
             "Here are some predefined risk assessment rules:\n{rules}\n\n"
             "Return your response in JSON format:\n"
-            "{{\"risk_score\": 0.65, \"recommendation\": \"Your recommendation here\"}}"
+            "{\"risk_score\": 0.65, \"recommendation\": \"Your recommendation here\"}"
         ),
     )
-
+    
     formatted_prompt = prompt_template.format(
         kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["risk_analysis"], indent=2),
+        rules=json.dumps(RULES["risk_analysis"], indent=2)
     )
-
+    print("Formatted Prompt:", formatted_prompt)  # Debugging print
     response = await call_azure_openai(formatted_prompt)
-    
-    return {
-        "risk_score": response.get("risk_score", 0.0),
-        "recommendation": response.get("recommendation", "No recommendation provided"),
-    }
+
+    # Ensure required keys exist
+    risk_score = response.get("risk_score", 0.0)
+    recommendation = response.get("recommendation", "No recommendation provided")
+
+    return {"risk_score": risk_score, "recommendation": recommendation}
 
 async def check_fraud(kyc_json: dict):
     prompt_template = PromptTemplate(
@@ -157,20 +117,17 @@ async def check_fraud(kyc_json: dict):
             "{kyc_data}\n\n"
             "Here are some predefined fraud detection rules:\n{rules}\n\n"
             "Return your response in JSON format:\n"
-            "{{\"fraud_detected\": false, \"fraud_reasons\": []}}"
+            "{\"fraud_detected\": false, \"fraud_reasons\": []}"
         ),
     )
-
+    
     formatted_prompt = prompt_template.format(
         kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["fraud_detection"], indent=2),
+        rules=json.dumps(RULES["fraud_detection"], indent=2)
     )
-
+    
     response = await call_azure_openai(formatted_prompt)
-    return {
-        "fraud_detected": response.get("fraud_detected", False),
-        "fraud_reasons": response.get("fraud_reasons", []),
-    }
+    return response
 
 async def check_compliance(kyc_json: dict):
     prompt_template = PromptTemplate(
@@ -180,20 +137,17 @@ async def check_compliance(kyc_json: dict):
             "{kyc_data}\n\n"
             "Here are some predefined compliance rules:\n{rules}\n\n"
             "Return your response in JSON format:\n"
-            "{{\"compliance_flags\": [], \"compliance_issues\": []}}"
+            "{\"compliance_flags\": [], \"compliance_issues\": []}"
         ),
     )
-
+    
     formatted_prompt = prompt_template.format(
         kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["compliance_rules"], indent=2),
+        rules=json.dumps(RULES["compliance_rules"], indent=2)
     )
-
+    
     response = await call_azure_openai(formatted_prompt)
-    return {
-        "compliance_flags": response.get("compliance_flags", []),
-        "compliance_issues": response.get("compliance_issues", []),
-    }
+    return response
 
 # API Endpoints
 @app.get("/")
