@@ -1,0 +1,19 @@
+{
+  "risk_analysis": {
+    "high_risk_countries": ["North Korea", "Iran", "Syria", "Cuba"],
+    "large_transactions": 10000,
+    "multiple_large_transactions": 3
+  },
+  "fraud_detection": {
+    "mismatched_info": ["name", "dob", "id_number"],
+    "suspicious_transaction_locations": [
+      "Offshore Accounts",
+      "Crypto Exchanges"
+    ]
+  },
+  "compliance_rules": {
+    "sanctioned_countries": ["Russia", "Venezuela"],
+    "blacklisted_emails": ["fraud@example.com", "scammer@mail.com"],
+    "invalid_id_patterns": ["000000", "123456"]
+  }
+}
