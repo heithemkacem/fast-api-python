@@ -1,6 +1,7 @@
 # File: api/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import json
 import asyncio
@@ -9,7 +10,7 @@ import os
 import re
 import requests
 from pydantic import EmailStr, Field, Extra
-
+import pdfkit
 app = FastAPI()
 
 # Enable CORS
@@ -37,18 +38,6 @@ RULES = load_rules()
 
 
 # Models
-class KYCData(BaseModel):
-    full_name: Optional[str] = None
-    dob: Optional[str] = None
-    nationality: Optional[str] = None
-    id_number: Optional[str] = None
-    email: Optional[EmailStr] = None
-    phone_number: Optional[str] = None
-    address: Optional[str] = None
-    transaction_history: Optional[List[Dict[str, Any]]] = None
-    
-    class Config:
-        extra = Extra.allow  # Allow extra fields in the JSONs
 
 
 class RiskAssessment(BaseModel):
@@ -107,12 +96,11 @@ def call_ollama(model_type: str, prompt: str):
     except Exception as e:
         return f"Error connecting to Ollama: {str(e)}"
 async def check_risk(kyc_json: dict):
-    kyc_data = KYCData(**kyc_json)
     prompt = (
         f"You are an expert in risk assessment. Analyze the risk for the following KYC data:\n\n"
         f"{json.dumps(kyc_json, indent=2)}\n\n"
-        f"Here are some predefined risk assessment rules:\n{json.dumps(RULES['risk_analysis'], indent=2)}\n\n"
-        "Use these rules as guidance, but also apply your own expertise and reasoning to generate a final risk assessment.\n"
+        "This data may contain any information relevant to a customer's financial background, identity documents, "
+        "or a combination of both. Consider all available data to assess risk.\n\n"
         "Return your response in valid JSON format with the following structure:\n"
         "{\n"
         "  \"risk_score\": 0.65,  // Float from 0 to 1 where 1 is highest risk\n"
@@ -123,10 +111,10 @@ async def check_risk(kyc_json: dict):
     response = call_ollama("risk", prompt)
 
     try:
-        parsed_response = json.loads(response)  # Now response is guaranteed to be JSON
+        parsed_response = json.loads(response)
 
         return {
-            "risk_score": float(parsed_response.get("risk_score", 0.5)),  # Ensure it's a float
+            "risk_score": float(parsed_response.get("risk_score", 0.5)),
             "recommendation": str(parsed_response.get("recommendation", "No recommendation provided"))
         }
     except json.JSONDecodeError:
@@ -134,14 +122,12 @@ async def check_risk(kyc_json: dict):
             "risk_score": 0.5,
             "recommendation": f"Failed to parse response: {response}"
         }
-
 async def check_fraud(kyc_json: dict):
-    kyc_data = KYCData(**kyc_json)
     prompt = (
         f"You are an expert in fraud detection. Analyze the following KYC data for fraud risk:\n\n"
         f"{json.dumps(kyc_json, indent=2)}\n\n"
-        f"Here are some predefined fraud detection rules:\n{json.dumps(RULES['fraud_detection'], indent=2)}\n\n"
-        "Use these rules as guidance, but also apply your own expertise and reasoning to detect any suspicious patterns.\n"
+        "This data may include identity documents, financial statements, or both. Identify any inconsistencies, "
+        "anomalies, or potential red flags that may indicate fraudulent activity.\n\n"
         "Return your response in valid JSON format with the following structure:\n"
         "{\n"
         "  \"fraud_detected\": false,  // Boolean value\n"
@@ -152,7 +138,7 @@ async def check_fraud(kyc_json: dict):
     response = call_ollama("fraud", prompt)
 
     try:
-        parsed_response = json.loads(response)  # Now response is guaranteed to be JSON
+        parsed_response = json.loads(response)
 
         return {
             "fraud_detected": bool(parsed_response.get("fraud_detected", False)),
@@ -174,7 +160,8 @@ async def check_compliance(kyc_json: dict):
     prompt = (
         f"You are a compliance officer. Check the following KYC data for regulatory compliance:\n\n"
         f"{json.dumps(kyc_json, indent=2)}\n\n"
-        f"Here are some predefined compliance rules:\n{json.dumps(RULES['compliance_rules'], indent=2)}\n\n"
+        "This data may contain any combination of personal identification details and financial records. "
+        "Identify any missing, incorrect, or non-compliant information.\n\n"
         "Return your response in valid JSON format:\n"
         "{\n"
         "  \"compliance_flags\": [\"List of minor compliance warnings\"],\n"
@@ -194,7 +181,7 @@ async def check_compliance(kyc_json: dict):
                 )
             return parsed_response
     except json.JSONDecodeError:
-        pass  # Handle bad responses
+        pass  
 
     return {
         "compliance_flags": ["Could not determine compliance status."],
@@ -228,7 +215,50 @@ async def analyze_kyc(request: KYCRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/generate-pdf")
+def generate_pdf(data: KYCResponse):
+    try:
+        html_content = f"""
+        <html>
+        <head><style>
+        body {{ font-family: Arial, sans-serif; }}
+        h1, h2 {{ color: #333; }}
+        .risk {{ background: #f8d7da; padding: 10px; }}
+        .fraud {{ background: #d4edda; padding: 10px; }}
+        .compliance {{ background: #fff3cd; padding: 10px; }}
+        </style></head>
+        <body>
+            <h1>KYC Analysis Report</h1>
+            <h2>Risk Assessment</h2>
+            <div class='risk'>
+                <p>Risk Score: {data.risk['risk_score'] * 100}%</p>
+                <p>Recommendation: {data.risk['recommendation']}</p>
+            </div>
 
+            <h2>Fraud Detection</h2>
+            <div class='fraud'>
+                <p>Fraud Detected: {"Yes" if data.fraud["fraud_detected"] else "No"}</p>
+                <ul>
+                    {''.join(f"<li>{reason}</li>" for reason in data.fraud["fraud_reasons"])}
+                </ul>
+            </div>
+
+            <h2>Compliance Check</h2>
+            <div class='compliance'>
+                <ul>
+                    {''.join(f"<li>{issue}</li>" for issue in data.compliance["compliance_issues"])}
+                </ul>
+            </div>
+        </body>
+        </html>
+        """
+        
+        pdf_file = "kyc_report.pdf"
+        pdfkit.from_string(html_content, pdf_file)
+        return FileResponse(pdf_file, filename="KYC_Report.pdf", media_type="application/pdf")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
