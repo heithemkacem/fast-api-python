@@ -1,27 +1,35 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import json
 import asyncio
 from typing import Dict, List, Optional, Any
 import os
-from pydantic import EmailStr, Extra
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+import re
+import requests
+import pdfkit
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import HumanMessage
 
 app = FastAPI()
 
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Azure OpenAI Model Configuration
+llm = AzureChatOpenAI(
+    openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+    azure_deployment=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+    openai_api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    temperature=0.2,
 )
 
 # Load KYC rules
@@ -31,27 +39,7 @@ def load_rules():
 
 RULES = load_rules()
 
-# Azure OpenAI Model Configuration
-llm = AzureChatOpenAI(
-    openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-    azure_deployment=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
-    temperature=0.2,
-)
-
 # Models
-class KYCData(BaseModel):
-    full_name: Optional[str] = None
-    dob: Optional[str] = None
-    nationality: Optional[str] = None
-    id_number: Optional[str] = None
-    email: Optional[EmailStr] = None
-    phone_number: Optional[str] = None
-    address: Optional[str] = None
-    transaction_history: Optional[List[Dict[str, Any]]] = None
-    
-    class Config:
-        extra = Extra.allow  # Allow extra fields in the JSONs
-
 class RiskAssessment(BaseModel):
     risk_score: float
     recommendation: str
@@ -71,83 +59,118 @@ class KYCResponse(BaseModel):
     risk: Dict[str, Any]
     fraud: Dict[str, Any]
     compliance: Dict[str, Any]
-async def call_azure_openai(prompt: str):
-    response = llm.invoke(prompt)
 
-    # Extract JSON from the response text using regex
-    match = re.search(r"\{.*\}", response.content, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return {"error": "Invalid JSON extracted", "raw_response": response.content}
-    
-    return {"error": "No JSON found", "raw_response": response.content}
+# Azure OpenAI call
 
+def call_openai(prompt: str) -> str:
+    try:
+        response = llm([HumanMessage(content=prompt)])
+        raw_response = response.content
+
+        # Extract JSON part
+        json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
+        if json_match:
+            clean_json = json_match.group(0)
+            clean_json = re.sub(r'//.*?\n', '', clean_json)
+            clean_json = re.sub(r'/\*.*?\*/', '', clean_json, flags=re.DOTALL)
+            return clean_json
+
+        return raw_response
+    except Exception as e:
+        return f"Error calling Azure OpenAI: {str(e)}"
+
+# Analysis Functions
 async def check_risk(kyc_json: dict):
-    prompt_template = PromptTemplate(
-        input_variables=["kyc_data", "rules"],
-        template=(
-            "You are an expert in risk assessment. Analyze the risk for the following KYC data:\n\n"
-            "{kyc_data}\n\n"
-            "Here are some predefined risk assessment rules:\n{rules}\n\n"
-            "Return your response in JSON format:\n"
-            "{\"risk_score\": 0.65, \"recommendation\": \"Your recommendation here\"}"
-        ),
+    prompt = (
+        f"You are an expert in risk assessment. Analyze the risk for the following KYC data:\n\n"
+        f"{json.dumps(kyc_json, indent=2)}\n\n"
+        "This data may contain any information relevant to a customer's financial background, identity documents, "
+        "or a combination of both. Consider all available data to assess risk.\n\n"
+        "Return your response in valid JSON format with the following structure:\n"
+        "{\n"
+        "  \"risk_score\": 0.65,\n"
+        "  \"recommendation\": \"Your recommendation here\"\n"
+        "}"
     )
-    
-    formatted_prompt = prompt_template.format(
-        kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["risk_analysis"], indent=2)
-    )
-    print("Formatted Prompt:", formatted_prompt)  # Debugging print
-    response = await call_azure_openai(formatted_prompt)
 
-    # Ensure required keys exist
-    risk_score = response.get("risk_score", 0.0)
-    recommendation = response.get("recommendation", "No recommendation provided")
+    response = call_openai(prompt)
 
-    return {"risk_score": risk_score, "recommendation": recommendation}
+    try:
+        parsed_response = json.loads(response)
+        return {
+            "risk_score": float(parsed_response.get("risk_score", 0.5)),
+            "recommendation": str(parsed_response.get("recommendation", "No recommendation provided"))
+        }
+    except json.JSONDecodeError:
+        return {
+            "risk_score": 0.5,
+            "recommendation": f"Failed to parse response: {response}"
+        }
 
 async def check_fraud(kyc_json: dict):
-    prompt_template = PromptTemplate(
-        input_variables=["kyc_data", "rules"],
-        template=(
-            "You are an expert in fraud detection. Analyze the following KYC data for fraud risk:\n\n"
-            "{kyc_data}\n\n"
-            "Here are some predefined fraud detection rules:\n{rules}\n\n"
-            "Return your response in JSON format:\n"
-            "{\"fraud_detected\": false, \"fraud_reasons\": []}"
-        ),
+    prompt = (
+        f"You are an expert in fraud detection. Analyze the following KYC data for fraud risk:\n\n"
+        f"{json.dumps(kyc_json, indent=2)}\n\n"
+        "This data may include identity documents, financial statements, or both. Identify any inconsistencies, "
+        "anomalies, or potential red flags that may indicate fraudulent activity.\n\n"
+        "Return your response in valid JSON format with the following structure:\n"
+        "{\n"
+        "  \"fraud_detected\": false,\n"
+        "  \"fraud_reasons\": []\n"
+        "}"
     )
-    
-    formatted_prompt = prompt_template.format(
-        kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["fraud_detection"], indent=2)
-    )
-    
-    response = await call_azure_openai(formatted_prompt)
-    return response
+
+    response = call_openai(prompt)
+
+    try:
+        parsed_response = json.loads(response)
+        return {
+            "fraud_detected": bool(parsed_response.get("fraud_detected", False)),
+            "fraud_reasons": list(parsed_response.get("fraud_reasons", []))
+        }
+    except json.JSONDecodeError:
+        return {
+            "fraud_detected": False,
+            "fraud_reasons": [f"Failed to parse response: {response}"]
+        }
 
 async def check_compliance(kyc_json: dict):
-    prompt_template = PromptTemplate(
-        input_variables=["kyc_data", "rules"],
-        template=(
-            "You are a compliance officer. Check the following KYC data for regulatory compliance:\n\n"
-            "{kyc_data}\n\n"
-            "Here are some predefined compliance rules:\n{rules}\n\n"
-            "Return your response in JSON format:\n"
-            "{\"compliance_flags\": [], \"compliance_issues\": []}"
-        ),
+    missing_fields = []
+    required_fields = ["nationality", "document_type", "date_of_birth"]
+
+    for field in required_fields:
+        if field not in kyc_json or not kyc_json[field]:
+            missing_fields.append(field)
+
+    prompt = (
+        f"You are a compliance officer. Check the following KYC data for regulatory compliance:\n\n"
+        f"{json.dumps(kyc_json, indent=2)}\n\n"
+        "This data may contain any combination of personal identification details and financial records. "
+        "Identify any missing, incorrect, or non-compliant information.\n\n"
+        "Return your response in valid JSON format:\n"
+        "{\n"
+        "  \"compliance_flags\": [\"List of minor compliance warnings\"],\n"
+        "  \"compliance_issues\": [\"List of critical compliance violations\"]\n"
+        "}"
     )
-    
-    formatted_prompt = prompt_template.format(
-        kyc_data=json.dumps(kyc_json, indent=2),
-        rules=json.dumps(RULES["compliance_rules"], indent=2)
-    )
-    
-    response = await call_azure_openai(formatted_prompt)
-    return response
+
+    response = call_openai(prompt)
+
+    try:
+        parsed_response = json.loads(response)
+        if "compliance_flags" in parsed_response and "compliance_issues" in parsed_response:
+            if missing_fields:
+                parsed_response["compliance_flags"].append(
+                    f"Missing required fields: {', '.join(missing_fields)}"
+                )
+            return parsed_response
+    except json.JSONDecodeError:
+        pass
+
+    return {
+        "compliance_flags": ["Could not determine compliance status."],
+        "compliance_issues": []
+    }
 
 # API Endpoints
 @app.get("/")
@@ -158,25 +181,60 @@ def read_root():
 async def analyze_kyc(request: KYCRequest):
     try:
         kyc_json = request.data
-        print("Received KYC Data:", kyc_json)  # Debugging print
-
         risk_result, fraud_result, compliance_result = await asyncio.gather(
             check_risk(kyc_json),
             check_fraud(kyc_json),
             check_compliance(kyc_json)
         )
-
-        print("Risk Result:", risk_result)  # Debugging print
-        print("Fraud Result:", fraud_result)  # Debugging print
-        print("Compliance Result:", compliance_result)  # Debugging print
-
         return {
             "risk": risk_result,
             "fraud": fraud_result,
             "compliance": compliance_result
         }
     except Exception as e:
-        print("Error:", str(e))  # Debugging print
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate-pdf")
+def generate_pdf(data: KYCResponse):
+    try:
+        html_content = f"""
+        <html>
+        <head><style>
+        body {{ font-family: Arial, sans-serif; }}
+        h1, h2 {{ color: #333; }}
+        .risk {{ background: #f8d7da; padding: 10px; }}
+        .fraud {{ background: #d4edda; padding: 10px; }}
+        .compliance {{ background: #fff3cd; padding: 10px; }}
+        </style></head>
+        <body>
+            <h1>KYC Analysis Report</h1>
+            <h2>Risk Assessment</h2>
+            <div class='risk'>
+                <p>Risk Score: {data.risk['risk_score'] * 100}%</p>
+                <p>Recommendation: {data.risk['recommendation']}</p>
+            </div>
+
+            <h2>Fraud Detection</h2>
+            <div class='fraud'>
+                <p>Fraud Detected: {"Yes" if data.fraud["fraud_detected"] else "No"}</p>
+                <ul>
+                    {''.join(f"<li>{reason}</li>" for reason in data.fraud["fraud_reasons"])}
+                </ul>
+            </div>
+
+            <h2>Compliance Check</h2>
+            <div class='compliance'>
+                <ul>
+                    {''.join(f"<li>{issue}</li>" for issue in data.compliance["compliance_issues"])}
+                </ul>
+            </div>
+        </body>
+        </html>
+        """
+        pdf_file = "kyc_report.pdf"
+        pdfkit.from_string(html_content, pdf_file)
+        return FileResponse(pdf_file, filename="KYC_Report.pdf", media_type="application/pdf")
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
